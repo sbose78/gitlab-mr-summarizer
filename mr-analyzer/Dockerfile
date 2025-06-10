@@ -1,4 +1,3 @@
- Dockerfile - Alpine-based, OpenShift-compatible
 FROM python:3.11-alpine
 
 WORKDIR /app
