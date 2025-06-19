@@ -1,4 +1,4 @@
-# Dockerfile
+# Dockerfile for DBT Repo Analyzer (Framework)
 FROM python:3.11-alpine
 
 # Install system dependencies including git and build tools
@@ -15,9 +15,9 @@ RUN apk add --no-cache \
     make \
     && rm -rf /var/cache/apk/*
 
-# Install dbt-core and Snowflake adapter (since all projects use Snowflake)
+# Install dbt-core 1.8.x and dbt-snowflake
 RUN pip install --no-cache-dir \
-    dbt-core \
+    dbt-core==1.8.* \
     dbt-snowflake
 
 # Configure git to disable SSL verification globally
@@ -39,18 +39,15 @@ ENV GIT_SSL_NO_VERIFY=true \
 WORKDIR /app
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY framework/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy framework application code
+COPY framework/ ./framework/
 
 # Make /app and /tmp writable for any user (OpenShift compatibility)
 RUN chmod -R g+rwX /app && \
     chmod -R g+rwX /tmp
-
-# Don't create specific user - let OpenShift assign UID
-# OpenShift will automatically assign a UID in the allowed range
 
 # Expose port
 EXPOSE 8000
@@ -59,5 +56,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the application
-CMD ["python", "dbt_repo_analyzer.py"]
+# Run the FastAPI application
+CMD ["uvicorn", "framework.webhook_service:app", "--host", "0.0.0.0", "--port", "8000"]

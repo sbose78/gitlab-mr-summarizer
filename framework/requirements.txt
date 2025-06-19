@@ -1,0 +1,30 @@
+# Web Framework
+fastapi>=0.68.0,<1.0.0
+uvicorn>=0.15.0,<1.0.0
+
+# HTTP Client
+requests>=2.26.0,<3.0.0
+httpx>=0.23.0,<1.0.0
+
+# DBT (Snowflake only)
+dbt-core==1.8.*
+dbt-snowflake
+
+# LLM/ML & Google Cloud
+google-cloud-aiplatform>=1.36.0
+google-auth>=2.0.0
+# Gemini/Generative AI
+google-generativeai>=0.3.0,<0.4.0
+
+# Type Hints
+typing-extensions>=4.0.0,<5.0.0
+
+# Environment Variables
+python-dotenv>=0.19.0,<1.0.0
+
+# Pydantic (for models)
+pydantic>=1.8.0,<3.0.0
+
+# Testing
+pytest>=7.0.0,<8.0.0
+pytest-asyncio>=0.18.0,<0.22.0 

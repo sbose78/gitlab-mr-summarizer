@@ -21,8 +21,10 @@ from datetime import datetime, timedelta
 import httpx
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+from google.oauth2 import service_account
+import requests
 
 # Configure logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,26 +41,104 @@ if LOG_LEVEL == "DEBUG":
 # Configuration
 GITLAB_TOKEN = os.getenv("GITLAB_API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "us-central1")
 GITLAB_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 GITLAB_BASE_URL = "https://gitlab.cee.redhat.com"
 REPO_CLONE_COOLDOWN_MINUTES = int(os.getenv("REPO_CLONE_COOLDOWN_MINUTES", "1"))
+DISABLE_MR_COMMENTS = os.getenv("DISABLE_MR_COMMENTS", "").lower() in ("true", "1", "yes")
 
-if not GITLAB_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("GITLAB_TOKEN and GEMINI_API_KEY environment variables are required")
+if not GITLAB_TOKEN:
+    raise ValueError("GITLAB_TOKEN environment variable is required")
+
+if not GEMINI_API_KEY and not GEMINI_SERVICE_ACCOUNT:
+    raise ValueError("Either GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS environment variable is required")
 
 if not GITLAB_WEBHOOK_SECRET:
     logger.warning("GITLAB_WEBHOOK_SECRET not set - webhook validation disabled (not recommended for production)")
 
+if DISABLE_MR_COMMENTS:
+    logger.info("MR comment updates are disabled - running in test mode")
+
 logger.info(f"Repository clone cooldown set to {REPO_CLONE_COOLDOWN_MINUTES} minutes")
 
 # Configure Gemini AI Client
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+if GEMINI_API_KEY:
+    # Use API key authentication
+    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    logger.info("Using Gemini API key authentication")
+else:
+    # Use service account authentication
+    credentials = service_account.Credentials.from_service_account_file(GEMINI_SERVICE_ACCOUNT)
+    # Extract project ID from service account credentials
+    with open(GEMINI_SERVICE_ACCOUNT) as f:
+        service_account_info = json.load(f)
+        project_id = service_account_info.get('project_id')
+        if not project_id:
+            raise ValueError("Project ID not found in service account credentials file")
+    
+    vertexai.init(project=project_id, location=GEMINI_LOCATION, credentials=credentials)
+    model = GenerativeModel("models/gemini-2.5-flash-preview-05-20")
+    generation_config = GenerationConfig(temperature=0.1, max_output_tokens=8000)
+    logger.info(f"Using Vertex AI authentication for project {project_id}")
 
 # Repository clone cooldown tracking
 repo_clone_cache = {}
 
 app = FastAPI(title="Data Product Promotion Handler")
 
+# Add these constants at the top of the file (after imports)
+PROMPT_MANIFEST_ANALYSIS = '''You must respond with ONLY a JSON object, no other text or explanation.
+
+Analyze this dbt manifest file and provide a summary in JSON format:
+{
+    "model_counts": {
+        "total": <int>,
+        "by_schema": {"schema_name": <int>}
+    },
+    "documentation_completeness": {
+        "by_schema": {"schema_name": {"documented": <int>, "undocumented": <int>}}
+    }
+}
+- Only count models, do not list them.
+- Skip models in the 'dbtlogs' schema.
+- For documentation completeness, count documented and undocumented models/columns per schema.
+- Respond with ONLY the JSON object, no other text.
+
+Manifest Content:
+{manifest_content}
+
+Remember: Respond with ONLY the JSON object, no other text.'''
+
+# Default prompt for manifest analysis: ask for Markdown tables directly
+DEFAULT_PROMPT_MANIFEST_ANALYSIS = (
+    'Respond ONLY with two Markdown tables:\n'
+    '1. Model counts by schema (excluding dbtlogs)\n'
+    '2. Documentation completeness by schema (documented/undocumented)\n'
+    'Do not include any other text or explanation.\n'
+    '\nManifest Content:\n{manifest_content}\n'
+)
+
+def load_manifest_prompt(manifest_content: str) -> str:
+    # Always use the default prompt, no env var or external loading
+    return DEFAULT_PROMPT_MANIFEST_ANALYSIS.format(manifest_content=manifest_content)
+
+# Default prompt for CI analysis: ask for Markdown tables directly
+DEFAULT_PROMPT_CI_ANALYSIS = (
+    'Respond ONLY with a Markdown table summarizing the environments, tests, and deployments, and a section for metadata publishing. '
+    'Do not include any other text or explanation.'
+    '\nCI Configuration:\n{ci_content}\n'
+)
+
+def load_ci_prompt(ci_content: str) -> str:
+    # Always use the default prompt, no env var or external loading
+    return DEFAULT_PROMPT_CI_ANALYSIS.format(ci_content=ci_content)
+
+MD_HEADING_PROMOTION = "## 🚀 Data Product Promotion Analysis"
+MD_HEADING_MANIFEST = "### dbt Project Analysis"
+MD_HEADING_CI = "### GitLab CI/CD Pipeline Analysis"
+MD_HEADING_ENV_OVERVIEW = "#### 1. Environment Overview"
+MD_HEADING_METADATA = "#### 2. Metadata Publishing"
 
 @dataclass
 class PromotionInfo:
@@ -110,6 +190,10 @@ class GitLabAPI:
     
     async def create_or_update_comment(self, project_id: int, mr_iid: int, content: str):
         """Create or update a comment on the MR"""
+        if DISABLE_MR_COMMENTS:
+            logger.info(f"[TEST MODE] Would have posted comment to MR {mr_iid}:\n{content}")
+            return
+
         # First, try to find existing bot comment
         existing_comment = await self._find_bot_comment(project_id, mr_iid)
         
@@ -160,18 +244,34 @@ class GitLabAPI:
             else:
                 logger.debug(f"Successfully updated comment {note_id}")
 
+    async def get_project_info(self, project_id: int) -> Optional[Dict]:
+        """Get project information"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}"
+        logger.debug(f"Fetching project information from: {url}")
+        
+        async with httpx.AsyncClient(verify=False) as client:
+            response = await client.get(url, headers=self.headers)
+            logger.debug(f"GitLab API response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to get project information: {response.text}")
+                return None
+            
+            project_info = response.json()
+            logger.debug(f"Retrieved project information: {project_info}")
+            return project_info
+
 
 class GeminiAnalyzer:
     """Gemini AI analyzer for MR changes and dbt manifests"""
     
-    def __init__(self, client: genai.Client):
-        self.client = client
+    def __init__(self, model: GenerativeModel, config: GenerationConfig):
+        self.model = model
+        self.config = config
     
     async def analyze_mr_for_promotion(self, changes: List[Dict]) -> Optional[PromotionInfo]:
         """Analyze MR changes to detect data product promotions"""
-        
-        logger.debug(f"Analyzing {len(changes)} changes for promotion patterns")
-        
+        try:
         # Extract file paths from changes
         file_changes = []
         for change in changes:
@@ -179,270 +279,235 @@ class GeminiAnalyzer:
                 file_path = change.get("new_path", change.get("old_path", ""))
                 file_changes.append({
                     "path": file_path,
-                    "action": "added" if change.get("new_file") else "modified"
-                })
-                logger.debug(f"Found file change: {file_path}")
-        
-        if not file_changes:
-            logger.debug("No relevant file changes found")
-            return None
-        
-        prompt = f"""
-        Analyze these GitLab MR file changes to determine if they represent a data product promotion:
+                        "content": change.get("diff", "")
+                    })
+            
+            prompt = f"""You must respond with ONLY a JSON object, no other text or explanation.
 
-        File changes:
+            Analyze these file changes from a GitLab merge request and determine if this is a data product promotion.
+            Look for patterns like:
+            1. Changes to dbt models in marts directory
+            2. Changes to CI/CD configuration
+            3. Changes to documentation
+            
+            File Changes:
         {json.dumps(file_changes, indent=2)}
 
-        Rules for promotion detection:
-        1. Look for additions of 'product.yaml' files to 'prod' or 'pre-prod' directories
-        2. The pattern should be: dataproducts/[source|aggregate]/[product_name]/[prod|pre-prod]/product.yaml
-        3. Extract the product name from the parent directory of the prod/pre-prod folder
-        4. Determine if it's source-aligned or aggregate based on the path
-
-        Respond with JSON only:
+            If this is a data product promotion, respond with ONLY this JSON:
+            {{
+                "is_promotion": true,
+                "product_name": "name of the data product",
+                "product_type": "source-aligned or aggregate",
+                "environment": "prod or pre-prod"
+            }}
+            
+            If this is not a data product promotion, respond with ONLY this JSON:
         {{
-            "is_promotion": boolean,
-            "product_name": "string or null",
-            "product_type": "source or aggregate or null", 
-            "environment": "prod or pre-prod or null",
-            "confidence": "high/medium/low"
-        }}
-        """
-        
-        try:
+                "is_promotion": false
+            }}
+            
+            Remember: Respond with ONLY the JSON object, no other text."""
+            
             logger.debug("Sending analysis request to Gemini API")
             response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model='gemini-2.5-flash-preview-05-20',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    temperature=0.1
-                )
+                self.model.generate_content,
+                prompt,
+                generation_config=self.config
             )
             logger.debug(f"Gemini API response: {response.text[:200]}...")
             
-            result = json.loads(response.text.strip())
-            logger.debug(f"Parsed Gemini result: {result}")
-            
-            if result.get("is_promotion") and result.get("confidence") in ["high", "medium"]:
-                # Construct dbt repo URL based on product type
-                product_type = result["product_type"]
-                product_name = result["product_name"]
-                
-                if product_type == "source":
-                    # source-aligned: /source-aligned/product/product-dbt
-                    dbt_repo_url = f"{GITLAB_BASE_URL}/dataverse/data-products/source-aligned/{product_name}/{product_name}-dbt"
-                elif product_type == "aggregate":
-                    # aggregate: /aggregate/product/product-dbt (NOT aggregate-aligned)
-                    dbt_repo_url = f"{GITLAB_BASE_URL}/dataverse/data-products/aggregate/{product_name}/{product_name}-dbt"
+            try:
+                # Clean the response to ensure it's only JSON
+                cleaned_response = response.text.strip()
+                # Remove any markdown code block markers
+                cleaned_response = cleaned_response.replace('```json', '').replace('```', '').strip()
+                result = json.loads(cleaned_response)
+                if result.get("is_promotion"):
+                    # Log the raw product type from Gemini
+                    logger.info(f"Raw product type from Gemini: {result['product_type']}")
+                    
+                    # Normalize product type
+                    product_type = result["product_type"].lower().strip()
+                    if "source" in product_type:
+                        product_type = "source-aligned"
+                    elif "aggregate" in product_type:
+                        product_type = "aggregate"
                 else:
-                    logger.warning(f"Unknown product type: {product_type}")
-                    dbt_repo_url = f"{GITLAB_BASE_URL}/dataverse/data-products/{product_type}/{product_name}/{product_name}-dbt"
-                
-                logger.info(f"Detected promotion: {product_name} ({product_type}) to {result['environment']}")
-                logger.debug(f"dbt repo URL: {dbt_repo_url}")
+                        logger.error(f"Unknown product type: {product_type}")
+                        return None
                 
                 return PromotionInfo(
-                    product_name=product_name,
+                        product_name=result["product_name"],
                     product_type=product_type,
                     environment=result["environment"],
-                    dbt_repo_url=dbt_repo_url,
-                    mr_iid=0,  # Will be set by caller
-                    project_id=0  # Will be set by caller
+                        dbt_repo_url="",  # Will be set later
+                        mr_iid=0,  # Will be set later
+                        project_id=0  # Will be set later
                 )
-            else:
-                logger.debug(f"No promotion detected. is_promotion: {result.get('is_promotion')}, confidence: {result.get('confidence')}")
-        except Exception as e:
-            logger.error(f"Error analyzing MR with Gemini: {e}")
-            logger.debug(f"Full error details: {e}", exc_info=True)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse Gemini response as JSON: {response.text}")
         
         return None
     
-    async def analyze_dbt_manifest(self, manifest_path: str) -> str:
-        """Analyze dbt manifest.json and generate summary"""
+        except Exception as e:
+            logger.error(f"Error analyzing MR with Gemini: {str(e)}")
+            return None
         
+    async def analyze_dbt_manifest(self, manifest_path: str) -> str:
+        """Pre-process manifest in Python, send only summary to Gemini for Markdown tables. No section header in output."""
         try:
+            import json
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
-            
-            # Extract key information
-            nodes = manifest.get("nodes", {})
-            tests = manifest.get("tests", {})
-            
-            # Analyze models by schema
-            models_by_schema = {}
-            marts_models = {}
-            test_results = {"passed": 0, "failed": 0, "total": 0}
-            
-            for node_id, node in nodes.items():
-                if node.get("resource_type") == "model":
-                    schema = node.get("schema", "unknown")
-                    if schema not in models_by_schema:
-                        models_by_schema[schema] = 0
-                    models_by_schema[schema] += 1
-                    
-                    # Track marts models specifically for metadata analysis
-                    if "marts" in schema.lower():
-                        marts_models[node.get("name", node_id)] = {
-                            "description": node.get("description", ""),
-                            "columns": node.get("columns", {})
-                        }
-                
-                elif node.get("resource_type") == "test":
-                    test_results["total"] += 1
-                    # Note: We can't determine pass/fail from manifest alone
-            
-            # Build focused summary
-            prompt = f"""
-            Create a crisp, focused dbt project analysis covering these specific areas:
-
-            SCHEMAS AND MODEL COUNTS:
-            {json.dumps(models_by_schema, indent=2)}
-
-            MARTS MODELS METADATA:
-            {json.dumps(marts_models, indent=2)}
-
-            TESTS:
-            - Total tests: {test_results["total"]}
-
-            Create a concise markdown summary with these sections only:
-            1. **Test Coverage** - Total number of tests and overall assessment. 
-                                    Only take into account tests for intermediate and marts schema.
-                                    Do not add any comments about tests, only state the numbers.
-            2. **Schemas & Models** - List each schema with model count. Skip dbtlogs schema.
-            3. **Marts Documentation** - For each model in marts schema, show:
-               - Model name and description (if any)
-               - Column documentation status (how many columns have descriptions)
-            
-
-            Keep it brief and actionable. Focus on data quality and documentation gaps.
-            Do NOT wrap the response in code blocks.
-            """
-            
-            logger.debug("Sending manifest analysis request to Gemini API")
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model='models/gemini-2.5-flash-preview-05-20',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=6000
-                )
+            models = [
+                {
+                    'name': m.get('name', ''),
+                    'schema': m.get('schema', ''),
+                    'documented': bool(m.get('description'))
+                }
+                for m in manifest.get('nodes', {}).values()
+                if m.get('resource_type') == 'model' and m.get('schema', '').lower() != 'dbtlogs'
+            ]
+            schemas = {}
+            doc_completeness = {}
+            for m in models:
+                schema = m['schema']
+                schemas[schema] = schemas.get(schema, 0) + 1
+                if schema not in doc_completeness:
+                    doc_completeness[schema] = {'documented': 0, 'undocumented': 0}
+                if m['documented']:
+                    doc_completeness[schema]['documented'] += 1
+                else:
+                    doc_completeness[schema]['undocumented'] += 1
+            summary = {
+                'model_counts': schemas,
+                'documentation_completeness': doc_completeness
+            }
+            prompt = (
+                'Respond ONLY with two Markdown tables:\n'
+                '1. Model counts by schema (excluding dbtlogs)\n'
+                '2. Documentation completeness by schema (documented/undocumented)\n'
+                'Do not include any other text or explanation.\n\n'
+                f"Summary data: {json.dumps(summary, indent=2)}\n"
             )
-            
-            # Check if response and response.text are valid
-            if not response:
-                logger.error("Gemini API returned no response for manifest analysis")
-                return "❌ Error: No response from Gemini API for manifest analysis"
-            
-            if not hasattr(response, 'text') or response.text is None:
-                logger.error("Gemini API response has no text attribute or text is None")
-                return "❌ Error: Invalid response format from Gemini API for manifest analysis"
-            
-            # The response should already be clean text without code blocks
-            response_text = response.text.strip()
-            
-            # Additional check for empty response
-            if not response_text:
-                logger.warning("Gemini API returned empty text for manifest analysis")
-                return "⚠️ Manifest analysis completed but no content was generated"
-            
-            logger.debug(f"Manifest analysis completed, response length: {len(response_text)}")
-            return response_text
-            
-        except FileNotFoundError:
-            logger.error(f"Manifest file not found: {manifest_path}")
-            return f"❌ Error: Manifest file not found at {manifest_path}"
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing manifest JSON: {e}")
-            return f"❌ Error parsing manifest JSON: {str(e)}"
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                prompt,
+                generation_config=self.config
+            )
+            # Do not add section header here
+            return response.text.strip() + "\n"
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logger.error(f"Error reading or parsing manifest file: {str(e)}")
+            return "Error: Could not read or parse manifest file"
         except Exception as e:
-            logger.error(f"Error analyzing manifest with Gemini: {e}")
-            logger.debug(f"Full error details: {e}", exc_info=True)
-            return f"❌ Error analyzing dbt manifest: {str(e)}"
+            logger.error(f"Error analyzing manifest: {str(e)}")
+            return f"Error: Failed to analyze manifest - {str(e)}"
     
     async def analyze_gitlab_ci(self, ci_file_path: str) -> str:
-        """Analyze .gitlab-ci.yml and generate pipeline summary"""
-        
+        """Detect environments, summarize tests/deployments per environment and metadata publishing with Gemini. No section header in output."""
         try:
-            with open(ci_file_path, 'r') as f:
                 import yaml
-                ci_config = yaml.safe_load(f)
-            
-            # Validate that we successfully loaded the YAML
-            if ci_config is None:
-                logger.warning(f"GitLab CI file {ci_file_path} is empty or invalid")
-                return "⚠️ GitLab CI file appears to be empty or invalid YAML"
-            
-            logger.debug(f"Successfully loaded GitLab CI config with {len(ci_config)} top-level keys")
-            
-            prompt = f"""
-
-Analyze this GitLab CI/CD pipeline configuration and provide a focused markdown summary with two distinct sections:
-
-1.  **Environment Overview**
-    Create a table summarizing the testing and deployment strategies for the 'dev' and 'pre-prod' environments based on the pipeline configuration.
-
-    | Environment | Tests (e.g., dbt test, data quality, unit) | Deployments (Automated/Manual) |
-    |-------------|--------------------------------------------|--------------------------------|
-    | dev         |                                            |                                |
-    | pre-prod    |                                            |                                |
-
-    Populate the 'Tests' column with the command or job names used for testing in each environment, such as `dbt test`. If no tests are defined, indicate that clearly.
-    Populate the 'Deployments' column indicating whether deployments to that environment are automated or manual, and briefly describe the deployment action.
-
-2.  **Metadata Publishing**
-    Check if metadata is being published to Atlan or any other data catalog within this pipeline.
-    If metadata publishing is not present, indicate that as well. Summarize the findings in a 1 sentence.
-
-    GITLAB CI CONFIG:
-    {json.dumps(ci_config, indent=2, default=str)}
-            """
-            
-            logger.debug("Sending GitLab CI analysis request to Gemini API")
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model='models/gemini-2.5-flash-preview-05-20',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=6000
+            import json
+            with open(ci_file_path, 'r') as f:
+                ci_content = yaml.safe_load(f)
+            env_jobs = {}
+            metadata_jobs = {}
+            for job_name, job in ci_content.items():
+                if not isinstance(job, dict):
+                    continue
+                env = job.get('environment')
+                if isinstance(env, dict):
+                    env = env.get('name', '')
+                if not isinstance(env, str):
+                    env = str(env)
+                script = job.get('script', [])
+                if isinstance(script, list):
+                    script = '\n'.join(script)
+                if not env:
+                    lowered = job_name.lower()
+                    if 'dev' in lowered:
+                        env = 'dev'
+                    elif 'preprod' in lowered or 'pre-prod' in lowered:
+                        env = 'pre-prod'
+                if env:
+                    if env not in env_jobs:
+                        env_jobs[env] = {'tests': [], 'deployments': []}
+                    if 'dbt test' in script or 'sqlfluff' in script:
+                        env_jobs[env]['tests'].append({'job_name': job_name, 'script': script})
+                    if 'dbt run' in script or 'deploy' in script:
+                        env_jobs[env]['deployments'].append({'job_name': job_name, 'script': script})
+                if 'atlan-dbt-artifact' in script or 'metadata' in job_name.lower() or 'artifact' in job_name.lower():
+                    metadata_jobs[job_name] = script
+            env_summaries = {}
+            for env, jobs in env_jobs.items():
+                if not env or env.lower() == 'none':
+                    continue
+                test_scripts = '\n\n'.join([f"Job: {j['job_name']}\n{j['script']}" for j in jobs['tests']])
+                import yaml as _yaml
+                deploy_defs = '\n\n'.join([
+                    f"Job: {j['job_name']}\n" + _yaml.dump(ci_content[j['job_name']], default_flow_style=False)
+                    for j in jobs['deployments'] if j['job_name'] in ci_content
+                ])
+                test_summary = ''
+                deploy_summary = ''
+                if test_scripts:
+                    test_prompt = (
+                        'Summarize the following CI job scripts as a single short description of the tests performed '
+                        '(e.g., dbt test, data quality, unit, linting). '
+                        'Do not include job names, just a readable summary.'
+                        f'\n\nScripts:\n{test_scripts}\n'
+                    )
+                    test_response = await asyncio.to_thread(
+                        self.model.generate_content,
+                        test_prompt,
+                        generation_config=self.config
+                    )
+                    test_summary = test_response.text.strip()
+                if deploy_defs:
+                    deploy_prompt = (
+                        'Summarize the following CI job definitions as a single short description of the deployments performed '
+                        '(e.g., dbt run, documentation generation, deployment target). '
+                        'For each deployment, determine if it is manual or automated based on the job definition (e.g., presence of "when: manual"). '
+                        'Include this information in the summary. Do not include job names, just a readable summary.'
+                        f'\n\nJob definitions:\n{deploy_defs}\n'
+                    )
+                    deploy_response = await asyncio.to_thread(
+                        self.model.generate_content,
+                        deploy_prompt,
+                        generation_config=self.config
+                    )
+                    deploy_summary = deploy_response.text.strip()
+                env_summaries[env] = {
+                    'tests': test_summary,
+                    'deployments': deploy_summary
+                }
+            metadata_summary = ''
+            if metadata_jobs:
+                meta_prompt = (
+                    'Summarize in 1-2 sentences how the following CI jobs handle metadata publishing or artifact upload. '
+                    'Focus on what files are uploaded and to where (e.g., S3, Atlan, etc).'
+                    f'\n\nJobs:\n' + '\n\n'.join([f"Job: {name}\n{script}" for name, script in metadata_jobs.items()]) + '\n'
                 )
-            )
-            
-            # Check if response and response.text are valid
-            if not response:
-                logger.error("Gemini API returned no response for GitLab CI analysis")
-                return "❌ Error: No response from Gemini API for GitLab CI analysis"
-            
-            if not hasattr(response, 'text') or response.text is None:
-                logger.error("Gemini API response has no text attribute or text is None")
-                return "❌ Error: Invalid response format from Gemini API for GitLab CI analysis"
-            
-            response_text = response.text.strip()
-            logger.debug(f"GitLab CI analysis completed, response length: {len(response_text)}")
-            
-            # Additional check for empty response
-            if not response_text:
-                logger.warning("Gemini API returned empty text for GitLab CI analysis")
-                return "⚠️ GitLab CI analysis completed but no content was generated"
-            
-            return response_text
-            
-        except FileNotFoundError:
-            logger.error(f"GitLab CI file not found: {ci_file_path}")
-            return f"❌ Error: GitLab CI file not found at {ci_file_path}"
-        except yaml.YAMLError as e:
-            logger.error(f"Error parsing GitLab CI YAML: {e}")
-            return f"❌ Error parsing GitLab CI YAML: {str(e)}"
-        except json.JSONEncoder as e:
-            logger.error(f"Error serializing GitLab CI config to JSON: {e}")
-            return f"❌ Error processing GitLab CI configuration: {str(e)}"
+                meta_response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    meta_prompt,
+                    generation_config=self.config
+                )
+                metadata_summary = meta_response.text.strip()
+            output = "### Testing and Deployment\n\n"
+            output += "| Environment | Tests (e.g., dbt test, data quality, unit) | Deployments (Automated/Manual) |\n|-------------|---------------------------------------------|-------------------------------|\n"
+            for env, summary in env_summaries.items():
+                output += f"| {env} | {summary['tests']} | {summary['deployments']} |\n"
+            output += "\n"
+            output += f"### Metadata Publishing\n\n{metadata_summary}\n"
+            return output
+        except (yaml.YAMLError, FileNotFoundError) as e:
+            logger.error(f"Error reading or parsing CI file: {str(e)}")
+            return "Error: Could not read or parse CI configuration file"
         except Exception as e:
-            logger.error(f"Error analyzing GitLab CI with Gemini: {e}")
-            logger.debug(f"Full error details: {e}", exc_info=True)
-            return f"❌ Error analyzing GitLab CI configuration: {str(e)}"
+            logger.error(f"Error analyzing CI with Gemini: {str(e)}")
+            return f"Error: Failed to analyze CI configuration - {str(e)}"
 
 
 class DBTRunner:
@@ -474,6 +539,16 @@ class DBTRunner:
     async def clone_and_parse(repo_url: str, gitlab_token: str = None) -> Tuple[bool, str, Optional[str], Optional[str]]:
         """Clone repo and run dbt parse, return (success, message, manifest_path, ci_file_path)"""
         
+        # Validate repository URL
+        if not repo_url or not repo_url.strip():
+            logger.error("Repository URL is empty")
+            return False, "Repository URL is empty", None, None
+            
+        # Log repository URL details
+        logger.info(f"Attempting to clone repository:")
+        logger.info(f"  URL: {repo_url}")
+        logger.info(f"  Using GitLab token: {'Yes' if gitlab_token else 'No'}")
+        
         # Check if repository is in cooldown period
         if DBTRunner.is_repo_in_cooldown(repo_url):
             cooldown_remaining = REPO_CLONE_COOLDOWN_MINUTES - (
@@ -494,6 +569,7 @@ class DBTRunner:
             
             # Clone repository with timeout (disable SSL verification)
             clone_cmd = ["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, temp_dir]
+            logger.info(f"Cloning repository: {repo_url}")
             
             result = await asyncio.to_thread(
                 subprocess.run, 
@@ -504,8 +580,9 @@ class DBTRunner:
             )
             
             if result.returncode != 0:
-                logger.error(f"Git clone failed: {result.stderr}")
-                return False, f"Git clone failed: {result.stderr}", None, None
+                error_msg = f"Git clone failed: {result.stderr}"
+                logger.error(error_msg)
+                return False, error_msg, None, None
             
             logger.info(f"Successfully cloned repository to {temp_dir}")
             
@@ -716,7 +793,7 @@ Cloning dbt repository and running analysis...
         return
     
     # Analyze manifest with Gemini
-    analyzer = GeminiAnalyzer(genai_client)
+    analyzer = GeminiAnalyzer(model, generation_config)
     manifest_summary = await analyzer.analyze_dbt_manifest(manifest_path)
     
     # Analyze GitLab CI if present
@@ -730,7 +807,6 @@ Cloning dbt repository and running analysis...
 """
     else:
         ci_section = """
-### GitLab CI/CD Pipeline Analysis
 
 ⚠️ No `.gitlab-ci.yml` file found in the repository
 """
@@ -804,6 +880,11 @@ async def handle_gitlab_webhook(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
         
+        # Log full payload structure for debugging
+        logger.info("Webhook payload structure:")
+        logger.info(f"  Object kind: {payload.get('object_kind', 'unknown')}")
+        logger.info(f"  Project data: {json.dumps(payload.get('project', {}), indent=2)}")
+        logger.info(f"  Object attributes: {json.dumps(payload.get('object_attributes', {}), indent=2)}")
 
         logger.debug(f"Parsed GitLab webhook payload: {payload.get('object_kind', 'unknown')} event")
         
@@ -828,8 +909,8 @@ async def handle_gitlab_webhook(
 
         logger.debug(f"Retrieved {len(changes)} changes for MR {mr_iid} in project {project_id}")
         
-        # Analyze changes with Gemini
-        analyzer = GeminiAnalyzer(genai_client)
+        # Analyze changes with Gemini first to get product information
+        analyzer = GeminiAnalyzer(model, generation_config)
         promotion = await analyzer.analyze_mr_for_promotion(changes)
 
         logger.debug(f"Promotion analysis result: {promotion}")
@@ -840,6 +921,24 @@ async def handle_gitlab_webhook(
         # Set MR details
         promotion.mr_iid = mr_iid
         promotion.project_id = project_id
+        
+        # Construct the dbt repository URL based on product type
+        base_url = "https://gitlab.cee.redhat.com/dataverse/data-products"
+        # Map product type to correct path
+        product_type_path = "source-aligned" if promotion.product_type == "source-aligned" else "aggregate"
+        repo_url = f"{base_url}/{product_type_path}/{promotion.product_name}/{promotion.product_name}-dbt"
+        
+        # Set the repository URL
+        promotion.dbt_repo_url = repo_url
+        
+        # Log repository URL details
+        logger.info(f"Repository URL details:")
+        logger.info(f"  Product name: {promotion.product_name}")
+        logger.info(f"  Product type: {promotion.product_type}")
+        logger.info(f"  Product type path: {product_type_path}")
+        logger.info(f"  Full URL: {repo_url}")
+        logger.info(f"  Project ID: {project_id}")
+        logger.info(f"  MR IID: {mr_iid}")
         
         # Process promotion in background
         background_tasks.add_task(process_promotion, promotion, gitlab_api)
