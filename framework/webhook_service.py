@@ -112,7 +112,7 @@ def get_mr_changes(project_id: str, mr_iid: str, token: str, mr_details: Dict = 
     # Get MR diffs
     diffs_url = urljoin(GITLAB_API_BASE_URL, f"/api/v4/projects/{project_id}/merge_requests/{mr_iid}/diffs")
     logger.info(f"Fetching MR diffs from URL: {diffs_url}")
-    logger.info(f"Headers: {headers}")
+    #logger.debug(f"Headers: {headers}")
     try:
         diffs_response = requests.get(diffs_url, headers=headers, verify=False)
         logger.info(f"MR diffs response status code: {diffs_response.status_code}")
