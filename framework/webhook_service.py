@@ -20,6 +20,7 @@ from framework.context import (
     GitCloneContextGenerator,
     DBTParseContextGenerator,
     CISummaryContextGenerator,
+    CustomReviewContextGenerator,
 )
 from framework.analysis.gemini import SimpleLLMAnalyzer
 from framework.notification import GitLabMRCommentNotifier
@@ -244,6 +245,7 @@ def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_de
                 DBTParseContextGenerator(),
                 ManifestSummaryContextGenerator(),
                 CISummaryContextGenerator(),
+                CustomReviewContextGenerator(),
             ]
             pipeline = Pipeline(
                 context_generators=context_generators,
@@ -307,6 +309,7 @@ def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, not
                     DBTParseContextGenerator(),
                     CISummaryContextGenerator(),
                     ManifestSummaryContextGenerator(),
+                    CustomReviewContextGenerator(),
                 ]
                 pipeline = Pipeline(
                     context_generators=context_generators,
