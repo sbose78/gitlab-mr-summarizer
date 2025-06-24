@@ -9,6 +9,7 @@ import urllib3
 import tempfile
 import subprocess
 import re
+import uuid
 from dataclasses import dataclass
 
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -51,9 +52,14 @@ app = FastAPI(title="DBT Repo Analyzer (Framework)")
 # GitLab API configuration
 GITLAB_API_BASE_URL = os.getenv("GITLAB_API_BASE_URL", "https://gitlab.cee.redhat.com")
 
-# Instantiate Gemini model and config once
-model = GenerativeModel("models/gemini-2.0-flash")
-generation_config = GenerationConfig(temperature=0.1, max_output_tokens=8000)
+# Create model factory to avoid shared instances
+def create_model():
+    """Create a new model instance for each request to avoid race conditions."""
+    return GenerativeModel("models/gemini-2.0-flash")
+
+def create_generation_config():
+    """Create a new generation config for each request."""
+    return GenerationConfig(temperature=0.1, max_output_tokens=8000)
 
 @dataclass
 class PipelineConfig:
@@ -67,7 +73,7 @@ def create_promotion_detection_pipeline(config: PipelineConfig) -> Pipeline:
     promotion_prompt = get_prompt_for_repo(config.project_path, "promotion")
     return Pipeline(
         context_generators=[],
-        analyzers=[SimpleLLMAnalyzer(model, generation_config, promotion_prompt, {"mr_changes"}, result_key="promotion_result")],
+        analyzers=[SimpleLLMAnalyzer(create_model(), create_generation_config(), promotion_prompt, {"mr_changes"}, result_key="promotion_result")],
         notifiers=[],
     )
 
@@ -77,7 +83,7 @@ def create_mr_summary_pipeline(config: PipelineConfig) -> Pipeline:
     mr_summary_prompt = get_prompt_for_repo(repo_url, "mr_summary")
     return Pipeline(
         context_generators=[],
-        analyzers=[SimpleLLMAnalyzer(model, generation_config, mr_summary_prompt, {"mr_changes", "title", "description", "source_branch", "target_branch", "commit_sha", "diff_content", "project_id", "mr_iid"}, result_key="final_md")],
+        analyzers=[SimpleLLMAnalyzer(create_model(), create_generation_config(), mr_summary_prompt, {"mr_changes", "title", "description", "source_branch", "target_branch", "commit_sha", "diff_content", "project_id", "mr_iid"}, result_key="final_md")],
         notifiers=[
             GitLabMRCommentNotifier(
                 config.gitlab_token,
@@ -192,41 +198,49 @@ class MRDetails:
             last_commit=object_attrs.get("last_commit"),
         )
 
-def build_mr_context(config: PipelineConfig, mr_details, get_mr_changes_func):
+def build_mr_context(config: PipelineConfig, mr_details, get_mr_changes_func, request_id: str = None):
+    """Build MR context with isolated dictionary to prevent race conditions."""
     mr_changes = get_mr_changes_func(config.project_id, config.mr_iid, config.gitlab_token)
     diff_content = json.dumps(mr_changes.get('files', []), indent=2)
+    
+    # Create a new isolated context dictionary for this request
     return {
-        "title": mr_details.title,
-        "description": mr_details.description,
-        "source_branch": mr_details.source_branch,
-        "target_branch": mr_details.target_branch,
-        "commit_sha": mr_details.sha or (mr_details.last_commit or {}).get("id") or "N/A",
-        "mr_changes": mr_changes,
-        "diff_content": diff_content,
-        "project_id": config.project_id,
-        "mr_iid": config.mr_iid,
+        "title": str(mr_details.title),
+        "description": str(mr_details.description),
+        "source_branch": str(mr_details.source_branch),
+        "target_branch": str(mr_details.target_branch),
+        "commit_sha": str(mr_details.sha or (mr_details.last_commit or {}).get("id") or "N/A"),
+        "mr_changes": dict(mr_changes),  # Create a copy
+        "diff_content": str(diff_content),
+        "project_id": str(config.project_id),
+        "mr_iid": str(config.mr_iid),
+        "request_id": request_id or "unknown",
     }
 
-def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_details: Dict) -> None:
+def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_details: Dict, request_id: str = None) -> None:
+    request_id = request_id or str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] Starting MR event handling for project {config.project_id}, MR {config.mr_iid}")
     try:
-        context = build_mr_context(config, mr_details, get_mr_changes_func)
+        context = build_mr_context(config, mr_details, get_mr_changes_func, request_id)
         mr_summary_pipeline = create_mr_summary_pipeline(config)
-        logger.info("Running MR summary pipeline...")
+        logger.info(f"[{request_id}] Running MR summary pipeline...")
         mr_summary_pipeline.run(context)
-        logger.info(f"MR summary pipeline: {mr_summary_pipeline}")
+        logger.info(f"[{request_id}] MR summary pipeline completed")
 
         if not config.project_path.endswith("dataverse-config/dataproduct-config"):
-            logger.info(f"Ignoring MR event for non-dataproduct-config repository: {config.project_path}")
+            logger.info(f"[{request_id}] Ignoring MR event for non-dataproduct-config repository: {config.project_path}")
             return
+        
+        logger.info(f"[{request_id}] Running promotion detection...")
         promotion_pipeline = create_promotion_detection_pipeline(config)
         promotion_result = promotion_pipeline.run(context)
-        logger.info(f"Promotion result: {promotion_result}")
+        logger.info(f"[{request_id}] Promotion result: {promotion_result}")
         promotion_result_raw = promotion_result.get("promotion_result")
         if promotion_result_raw:
             try:
                 promotion_data = extract_json_from_llm_output(promotion_result_raw)
             except Exception as e:
-                logger.error(f"Failed to parse promotion_result: {e}")
+                logger.error(f"[{request_id}] Failed to parse promotion_result: {e}")
                 promotion_data = {}
         else:
             promotion_data = {}
@@ -235,7 +249,7 @@ def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_de
         if not product_name or not product_type:
             raise ValueError("Product name or type not found in promotion result.")
         if promotion_data.get("is_promotion", False):
-            logger.info(f"Promotion detected: {promotion_data}")
+            logger.info(f"[{request_id}] Promotion detected: {promotion_data}")
             repo_url = get_dbt_repo_url(product_name, product_type)
             manifest_prompt = get_prompt_for_repo(repo_url, "manifest")
             ci_prompt = get_prompt_for_repo(repo_url, "ci")
@@ -245,11 +259,15 @@ def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_de
                 ManifestSummaryContextGenerator(),
                 CISummaryContextGenerator(),
             ]
+            # Create new context for promotion analysis with request_id
+            promotion_context = dict(context)
+            promotion_context["request_id"] = request_id
+            
             pipeline = Pipeline(
                 context_generators=context_generators,
                 analyzers=[
-                    SimpleLLMAnalyzer(model, generation_config, manifest_prompt, {"manifest_summary"}, result_key="manifest_summary"),
-                    SimpleLLMAnalyzer(model, generation_config, ci_prompt, {"ci_summary"}, result_key="ci_summary"),
+                    SimpleLLMAnalyzer(create_model(), create_generation_config(), manifest_prompt, {"manifest_summary"}, result_key="manifest_summary"),
+                    SimpleLLMAnalyzer(create_model(), create_generation_config(), ci_prompt, {"ci_summary"}, result_key="ci_summary"),
                 ],
                 notifiers=[
                     GitLabMRCommentNotifier(
@@ -259,39 +277,42 @@ def handle_mr_event(config: PipelineConfig, get_mr_changes_func: Callable, mr_de
                     ),
                 ],
             )
-            logger.info(f"Running pipeline: {pipeline}")
+            logger.info(f"[{request_id}] Running promotion analysis pipeline...")
             try:
-                pipeline.run(context)
+                pipeline.run(promotion_context)
+                logger.info(f"[{request_id}] Promotion analysis pipeline completed")
             finally:
                 for gen in context_generators:
                     if hasattr(gen, "cleanup"):
                         try:
                             gen.cleanup()
+                            logger.info(f"[{request_id}] Cleaned up {gen.__class__.__name__}")
                         except Exception as cleanup_exc:
-                            logger.warning(f"Cleanup failed for {gen}: {cleanup_exc}")
+                            logger.warning(f"[{request_id}] Cleanup failed for {gen}: {cleanup_exc}")
     except Exception as e:
-        logger.error(f"Exception in handle_mr_event: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"[{request_id}] Exception in handle_mr_event: {e}")
+        logger.error(f"[{request_id}] {traceback.format_exc()}")
         raise
 
-def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, note_content: str, mr_details: Dict) -> None:
+def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, note_content: str, mr_details: Dict, request_id: str = None) -> None:
+    request_id = request_id or str(uuid.uuid4())[:8]
     try:
         project_path = getattr(config, "project_path", "")
         if not project_path.endswith("dataverse-config/dataproduct-config"):
-            logger.info(f"Ignoring note event for non-dataproduct-config repository: {project_path}")
+            logger.info(f"[{request_id}] Ignoring note event for non-dataproduct-config repository: {project_path}")
             return
         if note_content.strip() == "/analyze-promotion":
-            context = build_mr_context(config, mr_details, get_mr_changes_func)
+            context = build_mr_context(config, mr_details, get_mr_changes_func, request_id)
             promotion_pipeline = create_promotion_detection_pipeline(config)
             promotion_result = promotion_pipeline.run(context)
             if promotion_result.get("is_promotion", True):
-                logger.info(f"Promotion detected: {promotion_result}")
+                logger.info(f"[{request_id}] Promotion detected: {promotion_result}")
                 promotion_result_raw = promotion_result.get("promotion_result")
                 if promotion_result_raw:
                     try:
                         promotion_data = extract_json_from_llm_output(promotion_result_raw)
                     except Exception as e:
-                        logger.error(f"Failed to parse promotion_result: {e}")
+                        logger.error(f"[{request_id}] Failed to parse promotion_result: {e}")
                         promotion_data = {}
                 else:
                     promotion_data = {}
@@ -311,8 +332,8 @@ def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, not
                 pipeline = Pipeline(
                     context_generators=context_generators,
                     analyzers=[
-                        SimpleLLMAnalyzer(model, generation_config, manifest_prompt, {"manifest_summary"}, result_key="manifest_summary"),
-                        SimpleLLMAnalyzer(model, generation_config, ci_prompt, {"ci_summary"}, result_key="ci_summary"),
+                        SimpleLLMAnalyzer(create_model(), create_generation_config(), manifest_prompt, {"manifest_summary"}, result_key="manifest_summary"),
+                        SimpleLLMAnalyzer(create_model(), create_generation_config(), ci_prompt, {"ci_summary"}, result_key="ci_summary"),
                     ],
                     notifiers=[
                         GitLabMRCommentNotifier(
@@ -330,11 +351,11 @@ def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, not
                             try:
                                 gen.cleanup()
                             except Exception as cleanup_exc:
-                                logger.warning(f"Cleanup failed for {gen}: {cleanup_exc}")
+                                logger.warning(f"[{request_id}] Cleanup failed for {gen}: {cleanup_exc}")
         else:
-            logger.info(f"Ignoring note event with content: {note_content}")
+            logger.info(f"[{request_id}] Ignoring note event with content: {note_content}")
     except Exception as e:
-        logger.error(f"Exception in handle_note_event: {e}")
+        logger.error(f"[{request_id}] Exception in handle_note_event: {e}")
         logger.error(traceback.format_exc())
         raise
 
@@ -345,7 +366,8 @@ def health_check():
 
 @app.post("/webhook/gitlab")
 async def webhook(request: Request, x_gitlab_token: str = Header(None)):
-    logger.info(f"Received webhook event: {request}")
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] Received webhook event")
     # Validate presence and value of GitLab webhook secret header
     expected_secret = os.getenv("WEBHOOK_SECRET")
     if x_gitlab_token is None:
@@ -354,21 +376,23 @@ async def webhook(request: Request, x_gitlab_token: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid X-Gitlab-Token header value")
     try:
         payload = await request.json()
-        logger.info(f"Webhook payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"[{request_id}] Webhook payload received for event")
         event_type = request.headers.get("X-Gitlab-Event")
         if not event_type:
             raise HTTPException(status_code=400, detail="Missing X-Gitlab-Event header")
+        
         config = PipelineConfig(
             gitlab_token=os.getenv("GITLAB_API_TOKEN"),
             project_id=str(payload["project"]["id"]),
             project_path=payload["project"]["web_url"],
         )
+        
         if event_type == "Merge Request Hook":
             config.mr_iid = str(payload["object_attributes"]["iid"])
             object_attrs = payload.get("object_attributes", {})
             mr_details = MRDetails.from_object_attrs(object_attrs)
-            logger.info(f"Extracted MR details from Merge Request Hook: {mr_details}")
-            handle_mr_event(config, get_mr_changes, mr_details)
+            logger.info(f"[{request_id}] Processing Merge Request Hook for project {config.project_id}, MR {config.mr_iid}")
+            handle_mr_event(config, get_mr_changes, mr_details, request_id)
         elif event_type == "Note Hook":
             config.mr_iid = str(payload["merge_request"]["iid"])
             action = payload["object_attributes"].get("action")
@@ -376,21 +400,26 @@ async def webhook(request: Request, x_gitlab_token: str = Header(None)):
                 merge_request = payload.get("merge_request", {})
                 mr_details = MRDetails.from_object_attrs(merge_request)
                 note_content = payload["object_attributes"]["note"]
-                handle_note_event(config, get_mr_changes, note_content, mr_details)
+                logger.info(f"[{request_id}] Processing Note Hook for project {config.project_id}, MR {config.mr_iid}")
+                handle_note_event(config, get_mr_changes, note_content, mr_details, request_id)
             else:
-                logger.info(f"Ignoring note event with action: {action}")
+                logger.info(f"[{request_id}] Ignoring note event with action: {action}")
         else:
+            logger.info(f"[{request_id}] Ignoring event type: {event_type}")
             return JSONResponse(
                 status_code=200,
                 content={"message": f"Ignoring event type: {event_type}"}
             )
+        
+        logger.info(f"[{request_id}] Webhook processed successfully")
         return JSONResponse(
             status_code=200,
-            content={"message": "Webhook processed successfully"}
+            content={"message": "Webhook processed successfully", "request_id": request_id}
         )
     except Exception as e:
-        logger.error(f"Exception in webhook handler: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"[{request_id}] Exception in webhook handler: {e}")
+        logger.error(f"[{request_id}] {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error [ID: {request_id}]")
 
 def main():
     """

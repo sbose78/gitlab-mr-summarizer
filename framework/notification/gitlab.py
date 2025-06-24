@@ -23,22 +23,24 @@ class GitLabMRCommentNotifier(Notifier):
     def notify(self, context, analysis_results):
         project_id = context['project_id']
         mr_iid = context['mr_iid']
+        request_id = context.get('request_id', 'unknown')
+        
         # Combine all analyzer results, separated by a horizontal rule
         content = "\n\n---\n\n".join(str(v) for v in analysis_results.values() if v)
         if self.marker:
             content = f"## {self.marker}\n\n{content}"
 
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would post to MR {mr_iid} in project {project_id} with marker '{self.marker}':\n{content}")
+            logger.info(f"[{request_id}] [DRY RUN] Would post to MR {mr_iid} in project {project_id} with marker '{self.marker}':\n{content}")
             return
 
         base_url = str(self.base_url)
         notes_url = f"{base_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes"
         headers = self.headers
-        logger.info(f"Fetching notes from URL: {notes_url}")
+        logger.info(f"[{request_id}] Fetching notes from URL: {notes_url}")
         # 1. Get all notes for the MR
         resp = requests.get(notes_url, headers=headers, verify=False)
-        logger.info(f"Response status code: {resp.status_code}")
+        logger.info(f"[{request_id}] Response status code: {resp.status_code}")
         #logger.info(f"Response content: {resp.text}")
         resp.raise_for_status()
         notes = resp.json()
@@ -54,17 +56,19 @@ class GitLabMRCommentNotifier(Notifier):
             # 3. Update the existing comment
             note_id = existing_note["id"]
             update_url = f"{notes_url}/{note_id}"
-            logger.info(f"Updating note at URL: {update_url}")
+            logger.info(f"[{request_id}] Updating note at URL: {update_url}")
             resp = requests.put(update_url, headers=headers, json={"body": content}, verify=False)
-            logger.info(f"Response status code: {resp.status_code}")
+            logger.info(f"[{request_id}] Response status code: {resp.status_code}")
             #logger.info(f"Response content: {resp.text}")
             resp.raise_for_status()
+            logger.info(f"[{request_id}] Successfully updated MR comment for project {project_id}, MR {mr_iid}")
             return resp.json()
         else:
             # 4. Create a new comment
-            logger.info(f"Creating new note at URL: {notes_url}")
+            logger.info(f"[{request_id}] Creating new note at URL: {notes_url}")
             resp = requests.post(notes_url, headers=headers, json={"body": content}, verify=False)
-            logger.info(f"Response status code: {resp.status_code}")
-            logger.info(f"Response content: {resp.text}")
+            logger.info(f"[{request_id}] Response status code: {resp.status_code}")
+            logger.info(f"[{request_id}] Response content: {resp.text}")
             resp.raise_for_status()
+            logger.info(f"[{request_id}] Successfully created MR comment for project {project_id}, MR {mr_iid}")
             return resp.json() 
