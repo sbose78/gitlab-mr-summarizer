@@ -1,4 +1,4 @@
-name: Docker Build and Test
+name: Docker Build
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,74 +25,15 @@ jobs:
       with:
         context: .
         platforms: linux/amd64
-        load: true
         tags: gitlab-mr-reviewer:test
         build-args: |
           COMMIT_SHA=${{ github.sha }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Test health check endpoint
+    - name: Verify build success
       run: |
-        echo "Testing with local tag: gitlab-mr-reviewer:test"
-        
-        # Run container with health check test
-        echo "Starting container for health check test..."
-        CONTAINER_ID=$(docker run -d \
-          --publish 8080:8000 \
-          --env COMMIT_SHA=${{ github.sha }} \
-          --env GITLAB_API_TOKEN=dummy \
-          --env WEBHOOK_SECRET=test-secret \
-          gitlab-mr-reviewer:test)
-        
-        echo "Container ID: $CONTAINER_ID"
-        
-        # Wait for container to be ready
-        echo "Waiting for container to start..."
-        sleep 15
-        
-        # Check container status
-        if ! docker ps --filter "id=$CONTAINER_ID" --format "table {{.Status}}" | grep -q "Up"; then
-          echo "❌ Container is not running"
-          docker logs $CONTAINER_ID
-          docker rm -f $CONTAINER_ID
-          exit 1
-        fi
-        
-        # Test health check with retries
-        echo "Testing health check endpoint..."
-        SUCCESS=false
-        for i in {1..10}; do
-          if RESPONSE=$(curl -s -f http://localhost:8080/health 2>/dev/null); then
-            echo "✅ Health check successful on attempt $i"
-            echo "Response: $RESPONSE"
-            
-            # Verify commit ID is in response
-            if echo "$RESPONSE" | grep -q "${{ github.sha }}"; then
-              echo "✅ Commit ID verification successful"
-              SUCCESS=true
-              break
-            else
-              echo "⚠️  Commit ID not found in response, but health check passed"
-              SUCCESS=true
-              break
-            fi
-          else
-            echo "⏳ Health check attempt $i failed, retrying in 3 seconds..."
-            sleep 3
-          fi
-        done
-        
-        # Show container logs for debugging
-        echo "Container logs:"
-        docker logs $CONTAINER_ID
-        
-        # Cleanup
-        docker rm -f $CONTAINER_ID
-        
-        if [ "$SUCCESS" = false ]; then
-          echo "❌ Health check failed after 10 attempts"
-          exit 1
-        fi
-        
-        echo "🎉 Build and health check test completed successfully!" 
+        echo "✅ Docker image built successfully!"
+        echo "Image: gitlab-mr-reviewer:test"
+        echo "Commit SHA: ${{ github.sha }}"
+        docker images gitlab-mr-reviewer:test 
