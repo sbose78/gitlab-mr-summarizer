@@ -43,7 +43,7 @@ jobs:
           type=ref,event=pr
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
-          type=sha,prefix={{branch}}-
+          type=sha,prefix=sha-
           type=raw,value=latest,enable={{is_default_branch}}
 
     - name: Build and push Docker image
@@ -68,7 +68,7 @@ jobs:
     - name: Test health check endpoint
       run: |
         # Pull the image that was just built
-        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
         
         # Run container with health check test
         echo "Starting container for health check test..."
@@ -77,7 +77,7 @@ jobs:
           --env COMMIT_SHA=${{ github.sha }} \
           --env GITLAB_API_TOKEN=dummy \
           --env WEBHOOK_SECRET=test-secret \
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }})
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }})
         
         echo "Container ID: $CONTAINER_ID"
         
