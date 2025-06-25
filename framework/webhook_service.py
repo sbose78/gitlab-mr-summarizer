@@ -341,7 +341,30 @@ def handle_note_event(config: PipelineConfig, get_mr_changes_func: Callable, not
 @app.get("/health")
 def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "dbt-repo-analyzer-framework"}
+    # Get commit ID from environment variable or git
+    commit_id = os.getenv("COMMIT_SHA")
+    if not commit_id:
+        try:
+            # Try to get commit ID from git
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"], 
+                capture_output=True, 
+                text=True, 
+                cwd=os.path.dirname(__file__)
+            )
+            if result.returncode == 0:
+                commit_id = result.stdout.strip()[:8]  # Short commit hash
+            else:
+                commit_id = "unknown"
+        except Exception:
+            commit_id = "unknown"
+    
+    return {
+        "status": "healthy", 
+        "service": "gitlab-mr-reviewer",
+        "commit_id": commit_id,
+        "version": "1.0.0"
+    }
 
 @app.post("/webhook/gitlab")
 async def webhook(request: Request, x_gitlab_token: str = Header(None)):

@@ -1,0 +1,130 @@
+name: Build and Test Container
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          COMMIT_SHA=${{ github.sha }}
+
+    - name: Test container health check
+      run: |
+        echo "Starting container for health check test..."
+        
+        # Run container in background
+        docker run -d \
+          --name gitlab-mr-reviewer-test \
+          --publish 8080:8000 \
+          --env COMMIT_SHA=${{ github.sha }} \
+          --env GITLAB_API_TOKEN=dummy \
+          --env WEBHOOK_SECRET=test-secret \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        
+        # Wait for container to start
+        echo "Waiting for container to start..."
+        sleep 10
+        
+        # Check if container is running
+        if ! docker ps | grep gitlab-mr-reviewer-test; then
+          echo "Container failed to start"
+          docker logs gitlab-mr-reviewer-test
+          exit 1
+        fi
+        
+        # Test health check endpoint
+        echo "Testing health check endpoint..."
+        for i in {1..30}; do
+          if curl -f http://localhost:8080/health; then
+            echo "Health check successful!"
+            break
+          else
+            echo "Health check attempt $i failed, retrying in 2 seconds..."
+            sleep 2
+          fi
+          
+          if [ $i -eq 30 ]; then
+            echo "Health check failed after 30 attempts"
+            docker logs gitlab-mr-reviewer-test
+            exit 1
+          fi
+        done
+        
+        # Verify health check response contains commit ID
+        echo "Verifying health check response..."
+        HEALTH_RESPONSE=$(curl -s http://localhost:8080/health)
+        echo "Health check response: $HEALTH_RESPONSE"
+        
+        # Check if response contains the commit SHA
+        if echo "$HEALTH_RESPONSE" | grep -q "${{ github.sha }}"; then
+          echo "✅ Health check response contains correct commit ID"
+        else
+          echo "❌ Health check response does not contain expected commit ID"
+          echo "Expected: ${{ github.sha }}"
+          echo "Got: $HEALTH_RESPONSE"
+          exit 1
+        fi
+        
+        # Cleanup
+        docker stop gitlab-mr-reviewer-test
+        docker rm gitlab-mr-reviewer-test
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif' 
