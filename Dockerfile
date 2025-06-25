@@ -1,6 +1,9 @@
 # Dockerfile for DBT Repo Analyzer (Framework)
 FROM python:3.11-alpine
 
+# Build argument for commit SHA
+ARG COMMIT_SHA=unknown
+
 # Install system dependencies including git and build tools
 RUN apk add --no-cache \
     git \
@@ -28,12 +31,13 @@ RUN git config --global http.sslVerify false && \
     git config --global http.sslKey "" && \
     git config --global http.sslCertPasswordProtected false
 
-# Set environment variables to disable SSL verification
+# Set environment variables to disable SSL verification and include commit SHA
 ENV GIT_SSL_NO_VERIFY=true \
     PYTHONHTTPSVERIFY=0 \
     CURL_CA_BUNDLE="" \
     REQUESTS_CA_BUNDLE="" \
-    SSL_VERIFY=false
+    SSL_VERIFY=false \
+    COMMIT_SHA=${COMMIT_SHA}
 
 # Set working directory
 WORKDIR /app
